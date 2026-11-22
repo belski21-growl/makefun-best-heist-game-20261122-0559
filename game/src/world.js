@@ -1,311 +1,423 @@
-// The heist simulation: one room at a time, fixed 1/60 s steps. The player
-// moves, sneaks and sprints; guards and cameras watch cones; the alarm meter
-// fills when the thief is seen and decays when hidden; tools cost charges
-// (EMP also costs alarm); loot is collected, the vault door is lockpicked,
-// and the getaway door ends the room. Events are bit flags the main loop
-// turns into screens and sounds.
-import { CAMERA, DETECTION, GUARD, LOOT_VALUE, PLAYER, STEP, TILE, TOOLS, TRIES } from './config.js';
-import { blocksMove, ROOMS, tileAt } from './level.js';
-import { cameraSees, createCamera, createGuard, updateCamera, updateGuard } from './guard.js';
-import { createRandom } from './random.js';
+// world.js — the heist simulation: rooms, the thief, the alarm, tools, loot.
+//
+// One world holds the whole run: three rooms, the thief's position and
+// stamina, every guard and camera, the alarm meter, the tool belt, and the
+// loot tally. step() advances it by one fixed slice. The title screen runs
+// an ambient version (guards walk, cameras sweep, nobody is watching the
+// thief); the real game only starts once the heist begins. Screens are
+// plain strings so the renderer and the shot stager can read them without
+// importing anything else.
+import {
+  TILE,
+  PLAYER,
+  GUARD,
+  CAMERA,
+  DETECTION,
+  TOOLS,
+  TRIES,
+  LOOT_VALUE,
+} from './config.js';
+import { ROOMS, tileAt, blocksMove, blocksSight } from './level.js';
+import { createGuard, stepGuard, viewerSees, sendGuardTo } from './guard.js';
 
-export const EVENT_LOOT = 1;
-export const EVENT_CAUGHT = 2;
-export const EVENT_ROOM_CLEAR = 4;
-export const EVENT_WIN = 8;
-export const EVENT_GAME_OVER = 16;
-export const EVENT_ALARM = 32;
-export const EVENT_LOCKDOWN = 64;
-export const EVENT_TOOL = 128;
+export const EVENT_CAUGHT = 1;
+export const EVENT_WIN = 2;
+export const EVENT_GAME_OVER = 4;
+export const EVENT_ROOM_CLEAR = 8;
+export const EVENT_LOOT = 16;
+export const EVENT_EMP = 32;
+export const EVENT_SMOKE = 64;
+export const EVENT_COIN = 128;
+export const EVENT_LOCKPICK = 256;
+export const EVENT_LOCKDOWN = 512;
 
-function centreOf(c, r) {
-  return { x: (c + 0.5) * TILE, y: (r + 0.5) * TILE };
+export const SCREEN_TITLE = 'title';
+export const SCREEN_PLAY = 'play';
+export const SCREEN_PAUSED = 'paused';
+export const SCREEN_CAUGHT = 'caught';
+export const SCREEN_WIN = 'win';
+export const SCREEN_GAME_OVER = 'gameover';
+
+const LOCKPICK_SECONDS = 1.5;
+const LOOT_REACH = 22;
+const EXIT_REACH = 24;
+const DOOR_REACH = 48;
+const RETRY_ALARM = 30;
+const POST_LOCKDOWN_ALARM = 30;
+
+function tileCenter(col, row) {
+  return { x: col * TILE + TILE / 2, y: row * TILE + TILE / 2 };
+}
+
+function lerpRate(pointBlank, atMaxRange, fraction) {
+  const f = Math.min(1, Math.max(0, fraction));
+  return pointBlank + (atMaxRange - pointBlank) * f;
+}
+
+function findDoorTiles(room) {
+  const doors = [];
+  for (let row = 0; row < room.map.length; row += 1) {
+    for (let col = 0; col < room.map[row].length; col += 1) {
+      if (tileAt(room, col, row) === 'D') {
+        const at = tileCenter(col, row);
+        doors.push({ x: at.x, y: at.y, col, row });
+      }
+    }
+  }
+  return doors;
+}
+
+function loadRoom(state, index) {
+  const room = ROOMS[index];
+  const start = tileCenter(room.player[0], room.player[1]);
+  state.roomIndex = index;
+  state.room = room;
+  state.roomTime = 0;
+  state.player.x = start.x;
+  state.player.y = start.y;
+  state.player.facing = 0;
+  state.player.sneaking = false;
+  state.player.stamina = PLAYER.staminaMax;
+  state.guards = room.guards.map((def) => createGuard(def));
+  state.cameras = room.cameras.map((cam) => {
+    const at = tileCenter(cam.tile[0], cam.tile[1]);
+    return {
+      x: at.x,
+      y: at.y,
+      base: cam.base,
+      sweep: cam.sweep,
+      facing: cam.base,
+      disabledLeft: 0,
+    };
+  });
+  state.loot = room.loot.map(([col, row, kind]) => {
+    const at = tileCenter(col, row);
+    return { x: at.x, y: at.y, kind, taken: false };
+  });
+  state.lootTaken = 0;
+  state.lootTarget = Number(room.target);
+  state.vaultOpen = false;
+  state.doorTiles = findDoorTiles(room);
+  state.lockpick = { progress: 0, active: false };
+  state.smokes = [];
+  state.coins = [];
+  state.alarm = 0;
+  state.lockdownLeft = 0;
+  state.lootValueAtRoomEntry = state.lootValue;
 }
 
 export function createWorld(random) {
   const state = {
-    random,
+    screen: SCREEN_TITLE,
     roomIndex: 0,
     room: ROOMS[0],
-    player: { x: 0, y: 0, facing: 0, sneaking: false, sprinting: false, stamina: PLAYER.staminaMax },
+    totalTime: 0,
+    roomTime: 0,
+    player: { x: 0, y: 0, facing: 0, sneaking: false, stamina: PLAYER.staminaMax },
     guards: [],
     cameras: [],
     loot: [],
-    vaultOpen: false,
-    lockpickLeft: 0,
-    alarm: 0,
-    lockdownLeft: 0,
-    triesLeft: TRIES,
-    lootValue: 0,
     lootTaken: 0,
     lootTarget: 0,
+    lootValue: 0,
+    lootValueAtRoomEntry: 0,
+    best: 0,
+    triesLeft: TRIES,
+    alarm: 0,
+    lockdownLeft: 0,
     tools: { emp: TOOLS.emp, smoke: TOOLS.smoke, coin: TOOLS.coin },
     smokes: [],
     coins: [],
-    time: 0,
-    totalTime: 0,
-    message: '',
-    messageLeft: 0,
+    vaultOpen: false,
+    doorTiles: [],
+    lockpick: { progress: 0, active: false },
+    rng: random,
   };
-  const world = {
+  loadRoom(state, 0);
+  return {
     state,
-    reset() {
-      state.roomIndex = 0;
-      state.triesLeft = TRIES;
-      state.lootValue = 0;
-      state.totalTime = 0;
-      loadRoom(state, 0);
-    },
     step(dt, input) {
       return stepWorld(state, dt, input);
     },
   };
-  loadRoom(state, 0);
-  return world;
 }
 
-/** Fill a room's live state from its definition: guards, cameras, loot, exit. */
-function loadRoom(state, index) {
-  const room = ROOMS[index];
-  state.roomIndex = index;
-  state.room = room;
-  const start = centreOf(room.player[0], room.player[1]);
-  state.player.x = start.x;
-  state.player.y = start.y;
-  state.player.facing = room.player[0] < 20 ? 0 : Math.PI;
-  state.player.stamina = PLAYER.staminaMax;
-  state.guards = room.guards.map(createGuard);
-  state.cameras = room.cameras.map(createCamera);
-  state.loot = room.loot.map(([c, r, kind]) => ({ ...centreOf(c, r), kind, taken: false }));
-  state.lootTarget = room.target;
-  state.lootTaken = 0;
-  state.vaultOpen = false;
-  state.lockpickLeft = 0;
-  state.alarm = Math.min(state.alarm, 25);
-  state.lockdownLeft = 0;
-  state.smokes = [];
-  state.coins = [];
-  state.message = room.name;
-  state.messageLeft = 2.5;
+export function beginHeist(world) {
+  if (world.state.screen === SCREEN_TITLE) world.state.screen = SCREEN_PLAY;
 }
 
-function say(state, message) {
-  state.message = message;
-  state.messageLeft = 2.5;
+export function resetRoom(world) {
+  const state = world.state;
+  state.lootValue = state.lootValueAtRoomEntry;
+  loadRoom(state, state.roomIndex);
+  state.alarm = RETRY_ALARM;
+  state.screen = SCREEN_PLAY;
 }
 
-function tileUnder(state, x, y) {
-  return tileAt(state.room, Math.floor(x / TILE), Math.floor(y / TILE));
+// A straight line is clear when no sight-blocking tile and no smoke cloud
+// sits on it. Sampled every few pixels so thin walls cannot be skipped.
+function segmentClear(state, x1, y1, x2, y2) {
+  const dx = x2 - x1;
+  const dy = y2 - y1;
+  const dist = Math.hypot(dx, dy);
+  const steps = Math.max(1, Math.ceil(dist / 8));
+  for (let i = 1; i < steps; i += 1) {
+    const t = i / steps;
+    const sx = x1 + dx * t;
+    const sy = y1 + dy * t;
+    const col = Math.floor(sx / TILE);
+    const row = Math.floor(sy / TILE);
+    if (blocksSight(state.room, col, row, state.vaultOpen)) return false;
+    for (const cloud of state.smokes) {
+      if (Math.hypot(sx - cloud.x, sy - cloud.y) < TOOLS.smokeRadius) return false;
+    }
+  }
+  return true;
 }
 
-/** How much of the detection rate applies where the thief stands: nothing in
- *  a vent, halved in shadow and halved again while sneaking. */
-function hiddenFactor(state) {
-  const t = tileUnder(state, state.player.x, state.player.y);
-  if (t === 'v') return DETECTION.ventFactor;
-  let factor = 1;
-  if (t === 's') factor *= DETECTION.shadowFactor;
-  if (state.player.sneaking) factor *= DETECTION.sneakFactor;
-  return factor;
+function movePlayer(state, ux, uy, speed, dt) {
+  const step = speed * dt;
+  const nx = state.player.x + ux * step;
+  const col = Math.floor(nx / TILE);
+  const row = Math.floor(state.player.y / TILE);
+  if (!blocksMove(state.room, col, row, state.vaultOpen)) state.player.x = nx;
+  const ny = state.player.y + uy * step;
+  const col2 = Math.floor(state.player.x / TILE);
+  const row2 = Math.floor(ny / TILE);
+  if (!blocksMove(state.room, col2, row2, state.vaultOpen)) state.player.y = ny;
 }
 
-/** Move the thief, axis by axis so a wall on one axis never blocks the other. */
-function movePlayer(state, dir, dt) {
+// Let every guard and live camera look at the thief for one step and fold
+// the strongest sighting into a single alarm rate. Returns the rate plus
+// whether any guard has held the thief long enough to catch them.
+function updateWatchers(state, dt, sneaking, inVent, inShadow, sightTest) {
   const p = state.player;
-  const onVent = tileUnder(state, p.x, p.y) === 'v';
+  const guardCtx = {
+    room: state.room,
+    vaultOpen: state.vaultOpen,
+    px: p.x,
+    py: p.y,
+    hasSight: sightTest,
+    lockdown: state.lockdownLeft > 0,
+    passive: false,
+  };
+  let maxRate = 0;
+  let caught = false;
+  for (const g of state.guards) {
+    const sight = stepGuard(g, dt, guardCtx);
+    if (g.caught) caught = true;
+    if (sight.seen && !inVent) {
+      const rate = lerpRate(
+        DETECTION.guardPointBlank,
+        DETECTION.guardMaxRange,
+        sight.dist / GUARD.coneRange,
+      );
+      if (rate > maxRate) maxRate = rate;
+    }
+  }
+  for (const cam of state.cameras) {
+    if (cam.disabledLeft > 0) continue;
+    const sight = viewerSees(
+      cam.x,
+      cam.y,
+      cam.facing,
+      CAMERA.coneRange,
+      CAMERA.coneHalfAngle,
+      p.x,
+      p.y,
+      sightTest,
+    );
+    if (sight.seen && !inVent) {
+      const rate = lerpRate(
+        DETECTION.cameraPointBlank,
+        DETECTION.cameraMaxRange,
+        sight.dist / CAMERA.coneRange,
+      );
+      if (rate > maxRate) maxRate = rate;
+    }
+  }
+  if (maxRate > 0) {
+    if (inShadow) maxRate *= DETECTION.shadowFactor;
+    if (sneaking) maxRate *= DETECTION.sneakFactor;
+  }
+  return { maxRate, caught };
+}
+
+function stepWorld(state, dt, input) {
+  // Frozen screens never advance: caught, win, game over, and pause hold
+  // the moment. The title screen runs the same simulation as play — the
+  // guards walk, the cameras sweep, the tools answer — because the title
+  // backdrop is the live world, and a fresh world's first step must already
+  // be a real one.
+  if (
+    state.screen !== SCREEN_TITLE &&
+    state.screen !== SCREEN_PLAY
+  ) {
+    return 0;
+  }
+
+  state.totalTime += dt;
+  state.roomTime += dt;
+
+  for (const cam of state.cameras) {
+    if (cam.disabledLeft > 0) cam.disabledLeft = Math.max(0, cam.disabledLeft - dt);
+    cam.facing = cam.base - Math.sin(state.totalTime * CAMERA.sweepSpeed) * cam.sweep;
+  }
+  for (const cloud of state.smokes) cloud.left -= dt;
+  state.smokes = state.smokes.filter((cloud) => cloud.left > 0);
+
+  const hasSight = (x1, y1, x2, y2) => segmentClear(state, x1, y1, x2, y2);
+
+  let events = 0;
+  const p = state.player;
+  const idleInput = {
+    x: 0,
+    y: 0,
+    sneak: false,
+    sprint: false,
+    interact: false,
+    emp: false,
+    smoke: false,
+    coinTarget: null,
+    ...input,
+  };
+
+  // --- tools: each press spends one charge, once. ---
+  if (idleInput.emp && state.tools.emp > 0) {
+    state.tools.emp -= 1;
+    for (const cam of state.cameras) cam.disabledLeft = CAMERA.empSeconds;
+    state.alarm = Math.min(DETECTION.lockdownAt, state.alarm + TOOLS.empAlarmCost);
+    events |= EVENT_EMP;
+  }
+  if (idleInput.smoke && state.tools.smoke > 0) {
+    state.tools.smoke -= 1;
+    state.smokes.push({ x: p.x, y: p.y, left: TOOLS.smokeSeconds });
+    events |= EVENT_SMOKE;
+  }
+  if (idleInput.coinTarget && state.tools.coin > 0) {
+    state.tools.coin -= 1;
+    const target = { x: idleInput.coinTarget.x, y: idleInput.coinTarget.y };
+    state.coins.push(target);
+    const free = state.guards.find((g) => g.state === 'patrol');
+    if (free) sendGuardTo(free, target, true);
+    events |= EVENT_COIN;
+  }
+
+  // --- movement: sneak is slow and quiet, sprint is fast and tiring. ---
+  const mag = Math.hypot(idleInput.x, idleInput.y);
+  const sneaking = !!idleInput.sneak;
+  p.sneaking = sneaking;
   let speed = PLAYER.walk;
-  p.sneaking = false;
-  p.sprinting = false;
-  if (dir.sneak && p.stamina > 0) {
-    speed = PLAYER.sneak;
-    p.sneaking = true;
-  } else if (dir.sprint && p.stamina > 0 && (dir.x !== 0 || dir.y !== 0)) {
-    speed = PLAYER.sprint;
-    p.sprinting = true;
+  if (sneaking) speed = PLAYER.sneak;
+  else if (idleInput.sprint && p.stamina > 1) speed = PLAYER.sprint;
+  if (mag > 0.01) {
+    const ux = idleInput.x / mag;
+    const uy = idleInput.y / mag;
+    movePlayer(state, ux, uy, speed, dt);
+    p.facing = Math.atan2(uy, ux);
+  }
+  if (speed === PLAYER.sprint && mag > 0.01) {
     p.stamina = Math.max(0, p.stamina - PLAYER.staminaDrain * dt);
   } else {
     p.stamina = Math.min(PLAYER.staminaMax, p.stamina + PLAYER.staminaRegen * dt);
   }
-  if (onVent) speed *= 0.6;
-  if (dir.x !== 0 || dir.y !== 0) p.facing = Math.atan2(dir.y, dir.x);
-  const nx = p.x + dir.x * speed * dt;
-  const ny = p.y + dir.y * speed * dt;
-  const r = PLAYER.radius;
-  if (!hitsWall(state, nx, p.y, r)) p.x = nx;
-  if (!hitsWall(state, p.x, ny, r)) p.y = ny;
-}
 
-/** True when a circle of radius r at (x, y) overlaps a movement-blocking tile. */
-function hitsWall(state, x, y, r) {
-  const points = [
-    [x - r, y - r], [x + r, y - r], [x - r, y + r], [x + r, y + r],
-    [x, y - r], [x, y + r], [x - r, y], [x + r, y],
-  ];
-  return points.some(([px, py]) => blocksMove(state.room,
-    Math.floor(px / TILE), Math.floor(py / TILE), state.vaultOpen));
-}
-
-function smokeAt(state, x, y) {
-  return state.smokes.some((s) => Math.hypot(x - s.x, y - s.y) < TOOLS.smokeRadius);
-}
-
-/** The view object guard.js and the cameras read: room, door, player, smoke. */
-function watcherView(state) {
-  return {
-    room: state.room,
-    vaultOpen: state.vaultOpen,
-    player: state.player,
-    inSmoke: (x, y) => smokeAt(state, x, y),
-  };
-}
-
-/** Alarm fill per second from one guard's cone, nearer = faster. */
-function guardFill(state, guard) {
-  const dist = Math.hypot(state.player.x - guard.x, state.player.y - guard.y);
-  const t = Math.min(1, dist / GUARD.coneRange);
-  return DETECTION.guardPointBlank + (DETECTION.guardMaxRange - DETECTION.guardPointBlank) * t;
-}
-
-function cameraFill(state, cam) {
-  const dist = Math.hypot(state.player.x - cam.x, state.player.y - cam.y);
-  const t = Math.min(1, dist / CAMERA.coneRange);
-  return DETECTION.cameraPointBlank + (DETECTION.cameraMaxRange - DETECTION.cameraPointBlank) * t;
-}
-
-function stepWorld(state, dt, input) {
-  let events = 0;
-  state.time += dt;
-  state.totalTime += dt;
-  if (state.messageLeft > 0) state.messageLeft -= dt;
-  for (const s of state.smokes) s.left -= dt;
-  state.smokes = state.smokes.filter((s) => s.left > 0);
-  for (const c of state.coins) c.left -= dt;
-  state.coins = state.coins.filter((c) => c.left > 0);
-
-  // Lockpick channel: stand still by the vault door, hold E's press.
-  if (state.lockpickLeft > 0) {
-    state.lockpickLeft -= dt;
-    if (state.lockpickLeft <= 0) {
-      state.vaultOpen = true;
-      say(state, 'Vault open — the Gilded Idol is yours for the taking.');
-      events |= EVENT_TOOL;
+  // --- the vault lock: one press by the door starts the pick; standing
+  // still keeps it turning, walking away resets the tumblers. ---
+  const picking = { active: state.lockpick.active, progress: state.lockpick.progress };
+  if (!state.vaultOpen && state.doorTiles.length > 0) {
+    let nearestDist = Infinity;
+    for (const door of state.doorTiles) {
+      const d = Math.hypot(door.x - p.x, door.y - p.y);
+      if (d < nearestDist) nearestDist = d;
     }
-  } else if (input.interact) {
-    const door = state.room.vaultDoor;
-    if (door && !state.vaultOpen) {
-      const d = centreOf(door[0], door[1]);
-      if (Math.hypot(state.player.x - d.x, state.player.y - d.y) < TILE * 1.6) {
-        state.lockpickLeft = 1.5;
-        say(state, 'Picking the vault lock… stay still.');
+    const byTheDoor = nearestDist < DOOR_REACH;
+    if (idleInput.interact && byTheDoor && mag <= 0.01) picking.active = true;
+    if (picking.active) {
+      if (!byTheDoor || mag > 0.01) {
+        picking.active = false;
+        picking.progress = 0;
+      } else {
+        picking.progress += dt;
+        if (picking.progress >= LOCKPICK_SECONDS) {
+          state.vaultOpen = true;
+          picking.progress = 0;
+          picking.active = false;
+          events |= EVENT_LOCKPICK;
+        }
       }
     }
-  }
-
-  // Tools, each spent from the thief's stock.
-  if (input.emp && state.tools.emp > 0) {
-    state.tools.emp -= 1;
-    for (const cam of state.cameras) cam.disabledLeft = CAMERA.empSeconds;
-    state.alarm = Math.min(100, state.alarm + TOOLS.empAlarmCost);
-    say(state, 'EMP pulse — cameras dark for 8s. The surge trips the alarm a little.');
-    events |= EVENT_TOOL;
-  }
-  if (input.smoke && state.tools.smoke > 0) {
-    state.tools.smoke -= 1;
-    state.smokes.push({ x: state.player.x, y: state.player.y, left: TOOLS.smokeSeconds });
-    say(state, 'Smoke out — cones cannot see through it.');
-    events |= EVENT_TOOL;
-  }
-  if (input.coinTarget && state.tools.coin > 0) {
-    state.tools.coin -= 1;
-    state.coins.push({ x: input.coinTarget.x, y: input.coinTarget.y, left: 6 });
-    for (const g of state.guards) {
-      g.lastSeen = { x: input.coinTarget.x, y: input.coinTarget.y };
-      g.memory = GUARD.memorySeconds;
-      if (g.state === 'patrol') {
-        // A patrolling guard goes to check the clatter — and scans the spot
-        // when nothing is there, instead of walking straight back.
-        g.state = 'investigate';
-        g.coinCheck = true;
-      }
-    }
-    say(state, 'Coin tossed — a guard goes to check the clatter.');
-    events |= EVENT_TOOL;
-  }
-
-  if (state.lockpickLeft <= 0) movePlayer(state, input, dt);
-
-  // Detection: every watching cone that sees the thief fills the alarm.
-  const hidden = hiddenFactor(state);
-  let seenBy = 0;
-  for (const g of state.guards) {
-    if (updateGuard(g, dt, watcherView(state))) seenBy = Math.max(seenBy, guardFill(state, g));
-  }
-  for (const cam of state.cameras) {
-    updateCamera(cam, dt);
-    if (cameraSees(cam, state.room, state.vaultOpen, watcherView(state))) {
-      seenBy = Math.max(seenBy, cameraFill(state, cam));
-    }
-  }
-  if (seenBy > 0) {
-    state.alarm = Math.min(100, state.alarm + seenBy * hidden * dt);
-    if (state.alarm >= DETECTION.suspiciousAt && state.alarm < DETECTION.lockdownAt) events |= EVENT_ALARM;
   } else {
-    state.alarm = Math.max(0, state.alarm - DETECTION.decay * dt);
+    picking.active = false;
+    picking.progress = 0;
   }
+  state.lockpick = picking;
 
-  // Lockdown at a full meter: every guard chases for lockdownSeconds.
-  if (state.alarm >= DETECTION.lockdownAt && state.lockdownLeft <= 0) {
-    state.lockdownLeft = DETECTION.lockdownSeconds;
-    for (const g of state.guards) g.state = 'chase';
-    say(state, 'LOCKDOWN — every guard is coming for you!');
-    events |= EVENT_LOCKDOWN;
-  }
-  if (state.lockdownLeft > 0) {
-    state.lockdownLeft -= dt;
-    if (state.lockdownLeft <= 0) state.alarm = 55;
-  }
-
-  // Caught: a chasing guard holds onto the thief for touchCatchSeconds.
-  for (const g of state.guards) {
-    if (g.state === 'chase' && Math.hypot(g.x - state.player.x, g.y - state.player.y) < GUARD.radius + PLAYER.radius + 2) {
-      g.touch += dt;
-      if (g.touch >= GUARD.touchCatchSeconds) {
-        state.triesLeft -= 1;
-        state.alarm = 30;
-        state.lockdownLeft = 0;
-        for (const gg of state.guards) { gg.state = 'patrol'; gg.touch = 0; }
-        if (state.triesLeft <= 0) return events | EVENT_GAME_OVER;
-        loadRoom(state, state.roomIndex);
-        return events | EVENT_CAUGHT;
-      }
-    } else {
-      g.touch = 0;
-    }
-  }
-
-  // Loot: walk over it to pocket it.
+  // --- loot: walk over it to pocket it. ---
   for (const item of state.loot) {
-    if (!item.taken && Math.hypot(item.x - state.player.x, item.y - state.player.y) < TILE * 0.8) {
+    if (!item.taken && Math.hypot(item.x - p.x, item.y - p.y) < LOOT_REACH) {
       item.taken = true;
       state.lootTaken += 1;
-      state.lootValue += LOOT_VALUE[item.kind];
-      say(state, `${item.kind === 'idol' ? 'The Gilded Idol' : item.kind === 'gold' ? 'Gold bars' : 'A painting'} — $${LOOT_VALUE[item.kind].toLocaleString('en-US')} in the bag.`);
+      state.lootValue += LOOT_VALUE[item.kind] ?? 0;
+      if (state.lootValue > state.best) state.best = state.lootValue;
       events |= EVENT_LOOT;
     }
   }
 
-  // Exit: the getaway door opens once this room's target is met.
-  const exit = centreOf(state.room.exit[0], state.room.exit[1]);
-  if (Math.hypot(exit.x - state.player.x, exit.y - state.player.y) < TILE * 0.9) {
-    if (state.lootTaken >= state.lootTarget) {
-      if (state.roomIndex >= ROOMS.length - 1) return events | EVENT_WIN;
-      loadRoom(state, state.roomIndex + 1);
-      return events | EVENT_ROOM_CLEAR;
-    }
-    say(state, `The getaway is locked — take ${state.lootTarget - state.lootTaken} more piece${state.lootTarget - state.lootTaken === 1 ? '' : 's'} first.`);
+  // --- eyes on the thief: guards and live cameras feed one alarm meter. ---
+  const playerCol = Math.floor(p.x / TILE);
+  const playerRow = Math.floor(p.y / TILE);
+  const tileHere = tileAt(state.room, playerCol, playerRow);
+  const inVent = tileHere === 'v';
+  const inShadow = tileHere === 's';
+  const sightTest = inVent ? () => false : hasSight;
+  const watched = updateWatchers(state, dt, sneaking, inVent, inShadow, sightTest);
+  const caught = watched.caught;
+  if (watched.maxRate > 0) {
+    state.alarm = Math.min(DETECTION.lockdownAt, state.alarm + watched.maxRate * dt);
+  } else {
+    state.alarm = Math.max(0, state.alarm - DETECTION.decay * dt);
   }
+
+  // --- lockdown: at 100 the whole estate hunts the thief for a while. ---
+  if (state.alarm >= DETECTION.lockdownAt && state.lockdownLeft <= 0) {
+    state.lockdownLeft = DETECTION.lockdownSeconds;
+    events |= EVENT_LOCKDOWN;
+  }
+  if (state.lockdownLeft > 0) {
+    state.lockdownLeft -= dt;
+    if (state.lockdownLeft <= 0) {
+      state.lockdownLeft = 0;
+      state.alarm = POST_LOCKDOWN_ALARM;
+    }
+  }
+
+  // --- the way out: all loot first, then the green door. ---
+  if (state.lootTaken >= state.lootTarget) {
+    const exit = tileCenter(state.room.exit[0], state.room.exit[1]);
+    if (Math.hypot(exit.x - p.x, exit.y - p.y) < EXIT_REACH) {
+      if (state.roomIndex < ROOMS.length - 1) {
+        events |= EVENT_ROOM_CLEAR;
+        loadRoom(state, state.roomIndex + 1);
+      } else {
+        state.screen = SCREEN_WIN;
+        events |= EVENT_WIN;
+      }
+      return events;
+    }
+  }
+
+  if (caught) {
+    state.triesLeft -= 1;
+    for (const g of state.guards) g.caught = false;
+    events |= EVENT_CAUGHT;
+    if (state.triesLeft > 0) {
+      state.screen = SCREEN_CAUGHT;
+    } else {
+      state.screen = SCREEN_GAME_OVER;
+      events |= EVENT_GAME_OVER;
+    }
+  }
+
   return events;
 }
-
-// Re-exported so the step's view object matches what guard.js expects.
-export { STEP };
