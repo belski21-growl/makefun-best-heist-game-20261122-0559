@@ -25,7 +25,7 @@ const ZERO_INPUT = {
 const PILOT_SECONDS = 30;
 const POSE_TILES = [
   [20, 8],
-  [20, 10],
+  [28, 13],
   [20, 15],
 ];
 const POSE_FREEZE_ALARM = 40;

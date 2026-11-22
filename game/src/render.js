@@ -97,8 +97,8 @@ function paintFloorTile(ctx, s, col, row, ch) {
     ctx.moveTo(x, y + TILE - 0.5);
     ctx.lineTo(x + TILE, y + TILE - 0.5);
     ctx.stroke();
-    if (dice < 0.25) {
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.10)';
+    if (dice < 0.5) {
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
       ctx.beginPath();
       ctx.moveTo(x + 5, y + 27);
       ctx.lineTo(x + 27, y + 5);
@@ -180,8 +180,8 @@ function paintCones(ctx, s) {
       cam.facing,
       CAMERA.coneRange,
       CAMERA.coneHalfAngle,
-      PALETTE.cameraCone,
-      'rgba(255, 122, 89, 0.45)',
+      'rgba(255, 178, 44, 0.20)',
+      'rgba(255, 178, 44, 0.55)',
       true,
     );
   }
@@ -298,8 +298,8 @@ function paintExit(ctx, s) {
   ctx.fill();
   ctx.restore();
   if (s.screen !== SCREEN_PLAY) return;
-  ctx.fillStyle = PALETTE.muted;
-  ctx.font = `11px ${FONT}`;
+  ctx.fillStyle = PALETTE.text;
+  ctx.font = `700 12px ${FONT}`;
   ctx.textAlign = 'center';
   ctx.fillText(s.lootTaken >= s.lootTarget ? 'OPEN' : 'GETAWAY', exit.x, exit.y - 24);
   ctx.fillStyle = PALETTE.text;
@@ -396,8 +396,8 @@ function paintPlayer(ctx, s) {
   ctx.arc(p.x, p.y, PLAYER.radius, 0, Math.PI * 2);
   ctx.fill();
   ctx.restore();
-  ctx.strokeStyle = 'rgba(0, 0, 0, 0.4)';
-  ctx.lineWidth = 1;
+  ctx.strokeStyle = 'rgba(0, 0, 0, 0.85)';
+  ctx.lineWidth = 2.5;
   ctx.beginPath();
   ctx.arc(p.x, p.y, PLAYER.radius, 0, Math.PI * 2);
   ctx.stroke();
@@ -419,7 +419,7 @@ function paintHud(ctx, s) {
   ctx.font = `700 15px ${FONT}`;
   ctx.fillText(s.room.name.toUpperCase(), 16, 18);
   ctx.fillStyle = PALETTE.muted;
-  ctx.font = `12px ${FONT}`;
+  ctx.font = `13px ${FONT}`;
   ctx.fillText(
     `Room ${s.roomIndex + 1}/3 · ${money(s.lootValue)} · Best ${money(s.best)}`,
     16,
@@ -440,6 +440,9 @@ function paintHud(ctx, s) {
   const word = s.alarm < 35 ? 'quiet' : s.alarm < 100 ? 'SUSPICIOUS' : 'LOCKDOWN';
   ctx.fillStyle =
     s.alarm < 35 ? PALETTE.muted : s.alarm < 70 ? PALETTE.alarmMid : PALETTE.alarmHigh;
+  ctx.font = `700 13px ${FONT}`;
+  ctx.textAlign = 'left';
+  ctx.fillText(String(Math.round(s.alarm)), 737, 18);
   ctx.font = `12px ${FONT}`;
   ctx.textAlign = 'center';
   ctx.fillText(word, ALARM_BAR_X + ALARM_BAR_WIDTH / 2, 36);
@@ -449,20 +452,20 @@ function paintHud(ctx, s) {
   ctx.font = `700 15px ${FONT}`;
   ctx.fillText(`◆ ${s.lootTaken}/${s.lootTarget}`, 790, 18);
   ctx.fillStyle = PALETTE.muted;
-  ctx.font = `12px ${FONT}`;
+  ctx.font = `13px ${FONT}`;
   const dots = '●'.repeat(s.triesLeft) + '○'.repeat(Math.max(0, 3 - s.triesLeft));
   ctx.fillText(`Tries ${dots}`, 790, 36);
 
   ctx.textAlign = 'right';
   ctx.fillStyle = PALETTE.text;
-  ctx.font = `12px ${FONT}`;
+  ctx.font = `13px ${FONT}`;
   ctx.fillText(
     `[1] EMP ×${s.tools.emp}  [2] Smoke ×${s.tools.smoke}  [Click] Coin ×${s.tools.coin}`,
     1264,
     18,
   );
   ctx.fillStyle = PALETTE.muted;
-  ctx.font = `11px ${FONT}`;
+  ctx.font = `12px ${FONT}`;
   ctx.fillText('WASD move · Shift sneak · Space sprint · E lockpick · P pause', 1264, 36);
 }
 
@@ -478,14 +481,17 @@ function paintBanner(ctx, s) {
 }
 
 function paintLegend(ctx) {
+  ctx.fillStyle = 'rgba(10, 12, 18, 0.72)';
+  roundRectPath(ctx, 8, 694, 262, 20, 6);
+  ctx.fill();
   ctx.strokeStyle = PALETTE.guard;
   ctx.lineWidth = 3;
   ctx.beginPath();
   ctx.moveTo(16, 707);
   ctx.lineTo(48, 707);
   ctx.stroke();
-  ctx.fillStyle = PALETTE.muted;
-  ctx.font = `11px ${FONT}`;
+  ctx.fillStyle = PALETTE.text;
+  ctx.font = `700 12px ${FONT}`;
   ctx.textAlign = 'left';
   ctx.fillText('guard eyes', 53, 712);
   ctx.strokeStyle = PALETTE.camera;

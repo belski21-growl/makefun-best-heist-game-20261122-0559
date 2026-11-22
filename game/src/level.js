@@ -43,7 +43,7 @@ export const ROOMS = [
     loot: [[5, 2, 'gold'], [34, 2, 'gold'], [5, 19, 'gold'], [34, 19, 'gold']],
     guards: [
       { waypoints: [[6, 3], [6, 18]], pause: 1 },
-      { waypoints: [[19, 10], [33, 10]], pause: 1 },
+      { waypoints: [[19, 10], [26, 12], [33, 10]], pause: 1 },
       { waypoints: [[33, 3], [33, 18]], pause: 1 },
     ],
     cameras: [
